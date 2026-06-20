@@ -192,6 +192,9 @@ typedef struct {
     uint32_t version;
     uint64_t n_tensors, n_kv;
     uint64_t data_start;
+    uint64_t kv_end;            // byte offset where the metadata-KV section ends (for the writer)
+    uint64_t ff_len_off;        // file offset of the qwen35.feed_forward_length scalar value (0 = none)
+    int      ff_len_vt;         // its gguf value-type id (for byte width) — patched on prune export
     uint32_t alignment;
 
     g4_tensor * tensors;
@@ -242,8 +245,10 @@ typedef struct {
     g4_str chat_template;
 } g4_model_file;
 
+extern int g4_mmap_cow;   // 1 = COW view (Vulkan-importable); 0 = read-only (no commit charge)
 int  g4_gguf_open(g4_model_file * mf, const char * path, bool verbose);
 void g4_gguf_close(g4_model_file * mf);
+int  g4_gguf_write(const g4_model_file * mf, const char * path);   // export current state (pruning)
 const g4_tensor * g4_find_tensor(const g4_model_file * mf, const char * name);
 void g4_gguf_dump(const g4_model_file * mf);
 
@@ -362,9 +367,29 @@ typedef struct {
     size_t  ck_stride_conv, ck_stride_ssm;
     int     ck_cap;                     // number of checkpoint slots allocated
     int     ck_on;                      // when set, scan/conv kernels write checkpoints
+    int     ck_base;                    // slot offset for checkpoint writes (per-token drafting)
     // scratch (single token)
     float * x, * xb, * cur, * tmp, * qkv, * convo, * qfull, * kb, * vb;
     float * attno, * z, * alpha, * beta, * gdec, * ffh, * ffh2, * att, * rc, * logits;
+    // FFN neuron importance capture (pruning M0): accumulate sum|silu(gate)*up| per
+    // intermediate unit over a calibration corpus. NULL/0 = capture off.
+    float * ffn_imp[G4_MAX_LAYERS];     // [n_ff] running sum of |activation| per neuron
+    float * ffn_mean[G4_MAX_LAYERS];    // [n_ff] running sum of signed activation (for bias comp)
+    long    ffn_imp_count;              // tokens accumulated
+    int     ffn_capture;               // 1 = accumulate during qwen_run_layers
+    // mean/bias compensation (pruning M2): per-layer additive correction applied after
+    // ffn_down = sum over dropped neurons of E[a_j] * W_down[:,j]. NULL = none.
+    float * ffn_bias[G4_MAX_LAYERS];    // [n_embd]
+    // blockwise least-squares compensation (pruning M3): per-layer block activation
+    // covariances [n_blocks][block*block] captured over the corpus when cov_block>0.
+    float * ffn_cov[G4_MAX_LAYERS];
+    int     cov_block;                  // block size (0 = don't capture covariances)
+    // zeroth-order (MeZO) LoRA fine-tuning: a low-rank adapter on ffn_down, trained
+    // forward-only by random perturbation. ffn_down output += scale * B*(A*ffh).
+    float * lora_a[G4_MAX_LAYERS];      // [rank][n_ff]   (init small gaussian)
+    float * lora_b[G4_MAX_LAYERS];      // [n_embd][rank] (init 0 -> initial delta = 0)
+    int     lora_rank, lora_l0, lora_l1;   // 0 rank = off; adapter on layers [l0,l1)
+    float   lora_scale;
 } qwen_ctx;
 
 int     g4_qwen_init(qwen_ctx * c, g4_model_file * mf, int n_ctx, int n_threads);
@@ -373,6 +398,22 @@ void    g4_qwen_reset(qwen_ctx * c);   // zero recurrent conv/ssm state (new con
 float * g4_qwen_forward(qwen_ctx * c, int token, int pos);  // logits for token at pos
 // batched (prefill): tokens[0..nb) at pos0..pos0+nb-1; logits of last token (or NULL)
 float * g4_qwen_forward_batch(qwen_ctx * c, const int * tokens, int nb, int pos0, bool want_logits);
+// per-position logits [nb][n_vocab] without spec checkpoints (perplexity / eval)
+float * g4_qwen_forward_logits(qwen_ctx * c, const int * tokens, int nb, int pos0, float * logits_out);
+// FFN neuron-importance capture (pruning M0): alloc accumulators + enable / disable
+int     g4_qwen_ffn_capture_begin(qwen_ctx * c);
+void    g4_qwen_ffn_capture_end(qwen_ctx * c);
+// FFN-width prune (pruning M1/M2): keep top `keep` fraction of neurons; ffn_down ->
+// down_quant. compensate=1 adds the dropped neurons' mean contribution as a per-layer bias.
+int     g4_qwen_prune_ffn(qwen_ctx * c, float keep, int down_quant, int compensate);
+// zeroth-order LoRA fine-tuning: allocate the adapter; perturb adds coef*z(seed) to all
+// adapter params (z regenerated from the seed, so no gradient/optimizer storage).
+int     g4_qwen_lora_init(qwen_ctx * c, int rank, int l0, int l1, float scale, uint64_t seed);
+void    g4_qwen_lora_perturb(qwen_ctx * c, float coef, uint64_t seed);
+// fold the trained adapter into ffn_down (W_down += scale*B*A) and clear it, so the
+// fine-tune persists in an exported GGUF. ffn_down types we can't re-encode (q4_K/
+// q5_K/q6_K) are written as Q8_0 (near-lossless). Returns 0 on success.
+int     g4_qwen_lora_merge(qwen_ctx * c);
 // speculative decoding (prompt-lookup): allocate per-token checkpoint buffers for up
 // to kmax+1 batch positions; forward_spec runs a verify batch writing those checkpoints
 // and returns per-position logits [nb][n_vocab]; state_restore rolls the recurrent
@@ -380,6 +421,10 @@ float * g4_qwen_forward_batch(qwen_ctx * c, const int * tokens, int nb, int pos0
 int     g4_qwen_spec_enable(qwen_ctx * c, int kmax);
 float * g4_qwen_forward_spec(qwen_ctx * c, const int * tokens, int nb, int pos0, float * logits_out);
 void    g4_qwen_state_restore(qwen_ctx * c, int idx);
+// self-speculative draft: build `draft` as a low-bit (draft_quant) in-RAM requant of
+// `mf_target`'s weights, same architecture. The draft proposes tokens cheaply; the
+// full-precision target verifies them. Returns 0 on success.
+int     g4_qwen_make_draft(qwen_ctx * draft, g4_model_file * mf_target, int draft_quant, int n_ctx, int n_threads);
 // One draft step: given input `token` and backbone hidden h_in[n_embd_out] for a
 // query at position `qpos`, return the drafted next-token id and write the chained
 // hidden h_out[n_embd_out]. `kv_last` = target's highest cached position.

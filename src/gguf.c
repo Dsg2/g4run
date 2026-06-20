@@ -3,6 +3,10 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+// 1 = copy-on-write view (default; needed for Vulkan host-pointer import).
+// 0 = read-only view (no pagefile commit charge) — set for CPU-only runs.
+int g4_mmap_cow = 1;
+
 // ---- type tables ----
 static const struct { int t; const char * name; int blck; int size; } type_tab[] = {
     { G4_F32,   "F32",   1,   4   },
@@ -130,12 +134,17 @@ int g4_gguf_open(g4_model_file * mf, const char * path, bool verbose) {
                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (hf == INVALID_HANDLE_VALUE) { fprintf(stderr, "g4: cannot open %s\n", path); return -1; }
     LARGE_INTEGER sz; GetFileSizeEx(hf, &sz);
-    // copy-on-write mapping: identical lazy paging for the CPU path (we never
-    // write), but the pages are registerable for Vulkan host-pointer import,
-    // which rejects PAGE_READONLY views on the Intel driver
-    HANDLE hm = CreateFileMappingA(hf, NULL, PAGE_WRITECOPY, 0, 0, NULL);
+    // Copy-on-write mapping: identical lazy paging for the CPU path (we never write),
+    // but the pages are registerable for Vulkan host-pointer import, which rejects
+    // PAGE_READONLY views on the Intel driver. COW commits the whole file against the
+    // pagefile, though — under tight commit a big read pass (e.g. writing an exported
+    // copy after a long finetune) can fault. g4_mmap_cow=0 selects a read-only view
+    // (file-backed, zero commit charge) for the CPU-only paths.
+    DWORD prot = g4_mmap_cow ? PAGE_WRITECOPY : PAGE_READONLY;
+    DWORD acc  = g4_mmap_cow ? FILE_MAP_COPY  : FILE_MAP_READ;
+    HANDLE hm = CreateFileMappingA(hf, NULL, prot, 0, 0, NULL);
     if (!hm) { CloseHandle(hf); fprintf(stderr, "g4: CreateFileMapping failed\n"); return -1; }
-    void * base = MapViewOfFile(hm, FILE_MAP_COPY, 0, 0, 0);
+    void * base = MapViewOfFile(hm, acc, 0, 0, 0);
     if (!base) { CloseHandle(hm); CloseHandle(hf); fprintf(stderr, "g4: MapViewOfFile failed\n"); return -1; }
     mf->map_base = base; mf->map_size = (uint64_t)sz.QuadPart;
     mf->h_file = hf; mf->h_map = hm;
@@ -207,6 +216,7 @@ int g4_gguf_open(g4_model_file * mf, const char * path, bool verbose) {
         }
 
         // scalars
+        uint64_t sc_off = (uint64_t)(c.p - (const uint8_t *)base);   // offset of this scalar's value bytes
         double dv = rd_scalar(&c, vt);
         if      (key_is(key, "general.alignment"))                          mf->alignment = (uint32_t)dv;
         else if (gkey(key, "block_count"))                                  mf->n_layer = (int)dv;
@@ -232,7 +242,7 @@ int g4_gguf_open(g4_model_file * mf, const char * path, bool verbose) {
         else if (key_is(key, "qwen35.block_count"))                         mf->n_layer = (int)dv;
         else if (key_is(key, "qwen35.context_length"))                      mf->n_ctx_train = (int)dv;
         else if (key_is(key, "qwen35.embedding_length"))                    mf->n_embd = (int)dv;
-        else if (key_is(key, "qwen35.feed_forward_length"))                 { for (int j = 0; j < G4_MAX_LAYERS; j++) mf->n_ff[j] = (int)dv; }
+        else if (key_is(key, "qwen35.feed_forward_length"))                 { for (int j = 0; j < G4_MAX_LAYERS; j++) mf->n_ff[j] = (int)dv; mf->ff_len_off = sc_off; mf->ff_len_vt = (int)vt; }
         else if (key_is(key, "qwen35.attention.head_count"))                mf->n_head = (int)dv;
         else if (key_is(key, "qwen35.attention.head_count_kv"))             mf->n_head_kv = (int)dv;
         else if (key_is(key, "qwen35.attention.key_length"))                mf->n_embd_head_k = (int)dv;
@@ -258,6 +268,7 @@ int g4_gguf_open(g4_model_file * mf, const char * path, bool verbose) {
         (void)skip_val; // silence unused (all values consumed via rd_scalar)
     }
     if (c.err) { fprintf(stderr, "g4: header parse error\n"); return -1; }
+    mf->kv_end = (uint64_t)(c.p - (const uint8_t *)base);   // start of tensor-info section
 
     // --- tensor infos ---
     mf->tensors = (g4_tensor *)calloc(mf->n_tensors, sizeof(g4_tensor));
@@ -333,6 +344,64 @@ int g4_gguf_open(g4_model_file * mf, const char * path, bool verbose) {
                 mf->head_dim_full, mf->head_dim_swa, mf->n_swa, mf->n_layer_kv);
     }
     mf->n_vocab = mf->tok_n;
+    return 0;
+}
+
+// Serialize the current model state to a new GGUF: the metadata-KV section is
+// copied verbatim from the source mapping (preserving tokenizer etc.), and the
+// tensor infos + data are re-emitted from mf->tensors[] as they are *now* — so a
+// tensor that was resized/repointed in place (e.g. a pruned FFN matrix) is written
+// at its new shape/type. Requires the source mapping to still be open.
+int g4_gguf_write(const g4_model_file * mf, const char * path) {
+    if (!mf->map_base || !mf->kv_end) { fprintf(stderr, "g4: gguf_write needs the source mapping\n"); return 1; }
+    FILE * f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "g4: cannot create %s\n", path); return 1; }
+    const uint8_t * base = (const uint8_t *)mf->map_base;
+    const uint32_t magic = 0x46554747u, ver = mf->version;
+    fwrite(&magic, 4, 1, f); fwrite(&ver, 4, 1, f);
+    fwrite(&mf->n_tensors, 8, 1, f); fwrite(&mf->n_kv, 8, 1, f);
+    // Metadata KV blob: copied verbatim, except feed_forward_length is patched to the
+    // actual (possibly pruned) FFN width so llama.cpp's tensor-shape check passes — it
+    // derives the expected ffn_gate/up/down shape from this scalar, not from the tensors.
+    int64_t new_ff = 0;
+    for (uint64_t i = 0; i < mf->n_tensors; i++)
+        if (strstr(mf->tensors[i].name, "ffn_gate")) { new_ff = mf->tensors[i].ne[1]; break; }
+    if (mf->ff_len_off && new_ff > 0 && mf->ff_len_vt <= GV_F64 && gv_scalar_size[mf->ff_len_vt] == 4) {
+        fwrite(base + 24, 1, (size_t)(mf->ff_len_off - 24), f);              // KV before the value
+        uint32_t v = (uint32_t)new_ff; fwrite(&v, 4, 1, f);                  // patched feed_forward_length
+        fwrite(base + mf->ff_len_off + 4, 1, (size_t)(mf->kv_end - mf->ff_len_off - 4), f);  // KV after
+    } else {
+        fwrite(base + 24, 1, (size_t)(mf->kv_end - 24), f);                  // verbatim (no patch needed)
+    }
+
+    uint64_t * off = malloc(mf->n_tensors * sizeof(uint64_t));
+    uint64_t * sz  = malloc(mf->n_tensors * sizeof(uint64_t));
+    uint64_t cur = 0;
+    for (uint64_t i = 0; i < mf->n_tensors; i++) {
+        const g4_tensor * t = &mf->tensors[i];
+        int64_t nelem = t->ne[0]*t->ne[1]*t->ne[2]*t->ne[3];
+        sz[i]  = (uint64_t)g4_row_size(t->type, t->ne[0]) * (uint64_t)(nelem / t->ne[0]);
+        off[i] = cur;
+        cur += (sz[i] + mf->alignment - 1) / mf->alignment * mf->alignment;
+    }
+    for (uint64_t i = 0; i < mf->n_tensors; i++) {              // tensor infos
+        const g4_tensor * t = &mf->tensors[i];
+        uint64_t nl = strlen(t->name);
+        fwrite(&nl, 8, 1, f); fwrite(t->name, 1, nl, f);
+        uint32_t nd = (uint32_t)t->ndim; fwrite(&nd, 4, 1, f);
+        for (int d = 0; d < t->ndim; d++) { uint64_t e = (uint64_t)t->ne[d]; fwrite(&e, 8, 1, f); }
+        uint32_t ty = (uint32_t)t->type; fwrite(&ty, 4, 1, f);
+        fwrite(&off[i], 8, 1, f);
+    }
+    long pos = ftell(f), ds = (pos + mf->alignment - 1) / mf->alignment * mf->alignment;
+    for (long k = pos; k < ds; k++) fputc(0, f);               // pad to data_start
+    for (uint64_t i = 0; i < mf->n_tensors; i++) {             // tensor data (each aligned)
+        fwrite(mf->tensors[i].data, 1, (size_t)sz[i], f);
+        uint64_t pad = (sz[i] + mf->alignment - 1) / mf->alignment * mf->alignment;
+        for (uint64_t k = sz[i]; k < pad; k++) fputc(0, f);
+    }
+    free(off); free(sz);
+    fclose(f);
     return 0;
 }
 

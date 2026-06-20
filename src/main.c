@@ -50,8 +50,31 @@ static void usage(void) {
            "  --draft N       draft tokens per round (default = nextn_predict_layers)\n"
            "  --spec N        qwen35 prompt-lookup speculative decoding, draft N tokens\n"
            "                  (greedy; output identical to plain greedy; one-shot -p)\n"
+           "  --draft-quant T with --spec N: self-speculative decode using a low-bit\n"
+           "                  in-RAM draft of the model (q2_k|q3_k|q4_0); helps free-form\n"
            "  --jit-quant T   requantize weights in RAM at load: q8_0|q4_0|q3_k|q2_k\n"
            "                  (smaller = faster but rougher; no smaller file needed)\n"
+           " qwen35 fine-tune (easy):\n"
+           "  --finetune F    MeZO (forward-only) LoRA finetune on text file F, then\n"
+           "  --ft-out G        save a fine-tuned copy to G. Good defaults built in:\n"
+           "                    g4run -m M --finetune F.txt --ft-out tuned.gguf\n"
+           "  --ft-preset P   quick | standard | thorough  (sets rank/steps/lr/clip/q)\n"
+           " qwen35 fine-tune (advanced overrides):\n"
+           "                  --ft-rank/--ft-steps/--ft-lr/--ft-eps/--ft-scale/--ft-batch\n"
+           "                  --ft-layers a:b (default: auto middle band)  --ft-eval N\n"
+           "                  --ft-clip C (anti-divergence)   --ft-q N (avg N perturbations/step)\n"
+           " qwen35 FFN prune (easy):\n"
+           "  --prune-preset P  light | balanced | aggressive  (keep 80/70/50%% + LS comp),\n"
+           "                    then --export G to save:  g4run -m M --prune-preset balanced --export p.gguf\n"
+           " qwen35 FFN prune (advanced overrides):\n"
+           "  --prune K       keep fraction K of FFN neurons (1.0 = no-op); reports PPL+KL\n"
+           "  --prune-down T  ffn_down requant: q8_0(def)|q4_0|q3_k|q2_k\n"
+           "  --compensate    dropped-neuron mean as a per-layer bias (M2)\n"
+           "  --comp-ls       blockwise least-squares comp, folded into ffn_down (M3;\n"
+           "                  exports cleanly); --ls-block N sets the block size (256)\n"
+           "  --export F      write the (pruned) model to GGUF file F\n"
+           "  --perplexity    eval: perplexity of -p corpus (quality metric)\n"
+           "  --prune-stats F qwen35: dump FFN neuron importance over -p corpus to F\n"
            "  --cache-type-k T  KV cache K type: f16 (default) | q8_0 | q4_0\n"
            "  --cache-type-v T  KV cache V type: f16 (default) | q8_0 | q4_0\n"
            "  --server        run as an HTTP/JSON server (sockets)\n"
@@ -60,6 +83,8 @@ static void usage(void) {
            "  --no-bos        don't add BOS (override metadata)\n"
            "  --bos           force add BOS\n"
            "  --dump          dump GGUF metadata and exit\n"
+           "  --fix-llama     patch a pruned model's feed_forward_length metadata in place\n"
+           "                  to match its tensors, so it loads in llama.cpp (qwen35)\n"
            "  --selftest      run kernel selftests and exit\n"
            "  --tokenize STR  tokenize STR, print ids, exit\n"
            "  --parse-special parse special tokens in prompt text\n"
@@ -589,6 +614,116 @@ static int run_qwen_spec(qwen_ctx * qc, g4_tok * tok,
     return 0;
 }
 
+// qwen35 self-speculative decoding with a quantized draft of the SAME model (greedy;
+// output identical to plain greedy). The cheap low-bit draft proposes K tokens; the
+// full-precision target verifies them in one batched forward. Both recurrent states
+// are checkpointed per token and rolled back to the accepted prefix on rejection.
+static int run_qwen_spec_model(qwen_ctx * tgt, qwen_ctx * dft, g4_tok * tok,
+                               const char * prompt, bool raw, const char * sys_prompt,
+                               int n_gen, int n_ctx, int K, bool parse_special, bool verbose) {
+    const int64_t nv = tgt->mf->n_vocab;
+    static int ids[65536];
+    int n_in;
+    if (raw) {
+        n_in = g4_tok_encode(tok, prompt ? prompt : "", ids, 65536, false, parse_special);
+    } else {
+        char buf[65536]; char * p = buf; size_t rem = sizeof(buf); int w;
+        if (sys_prompt) { w = snprintf(p, rem, "<|im_start|>system\n%s<|im_end|>\n", sys_prompt); p += w; rem -= w; }
+        snprintf(p, rem, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt ? prompt : "");
+        n_in = g4_tok_encode(tok, buf, ids, 65536, false, true);
+    }
+    if (n_in < 1) { fprintf(stderr, "g4: empty prompt\n"); return 1; }
+    if (g4_qwen_spec_enable(tgt, K) || g4_qwen_spec_enable(dft, K)) return 1;
+
+    float * vlog  = malloc((size_t)(K + 1) * nv * 4);   // target per-position verify logits
+    float * dlog  = malloc((size_t)nv * 4);             // draft logits (one token)
+    int   * batch = malloc((size_t)(K + 1) * sizeof(int));
+    int   * draft = malloc((size_t)K * sizeof(int));
+    if (!vlog || !dlog || !batch || !draft) { fprintf(stderr, "g4: spec alloc failed\n"); return 1; }
+    #define ARGMAX(P) ({ const float * _p = (P); int _b = 0; float _v = _p[0]; \
+        for (int64_t _i = 1; _i < nv; _i++) if (_p[_i] > _v) { _v = _p[_i]; _b = (int)_i; } _b; })
+
+    SetConsoleCtrlHandler(ctrl_handler, TRUE);
+    double tp0 = g4_time_ms();
+    float * logits = NULL;
+    for (int i = 0; i + 1 < n_in; i += G4_BATCH_MAX) {     // prefill BOTH models on the prompt
+        int b = (n_in - 1) - i < G4_BATCH_MAX ? (n_in - 1) - i : G4_BATCH_MAX;
+        g4_qwen_forward_batch(tgt, ids + i, b, i, false);
+        g4_qwen_forward_batch(dft, ids + i, b, i, false);
+    }
+    logits = g4_qwen_forward_batch(tgt, ids + (n_in - 1), 1, n_in - 1, true);
+    g4_qwen_forward_batch(dft, ids + (n_in - 1), 1, n_in - 1, false);   // sync draft to pos n_in-1
+    double tp1 = g4_time_ms();
+
+    int pos = n_in, next_tok = ARGMAX(logits);
+    u8stream us = {{0}, 0};
+    int generated = 0;
+    long n_drafted = 0, n_accepted = 0, n_rounds = 0;
+    double tg0 = g4_time_ms();
+    for (;;) {
+        if (g4_tok_is_eog(tok, next_tok)) break;
+        { char b[256]; int l = g4_tok_decode(tok, next_tok, b, false); u8_emit(&us, b, l); }
+        generated++;
+        if ((n_gen >= 0 && generated >= n_gen) || g_interrupt || pos >= n_ctx - 1) break;
+
+        int Keff = K;
+        if (pos + Keff + 1 >= n_ctx) Keff = n_ctx - 1 - pos;
+        if (Keff < 1) break;
+
+        // draft Keff tokens with the cheap model; ckpt[i] = draft state after input i (@ pos+i)
+        int dtok = next_tok, nd = 0;
+        for (int i = 0; i < Keff; i++) {
+            dft->ck_base = i;
+            g4_qwen_forward_spec(dft, &dtok, 1, pos + i, dlog);
+            draft[nd++] = ARGMAX(dlog);
+            dtok = draft[nd - 1];
+        }
+        dft->ck_base = 0;
+        n_drafted += nd; n_rounds++;
+
+        // verify [next_tok, draft...] with the target in one batch
+        batch[0] = next_tok;
+        for (int i = 0; i < nd; i++) batch[1 + i] = draft[i];
+        g4_qwen_forward_spec(tgt, batch, nd + 1, pos, vlog);
+
+        int n_acc = 0;
+        while (n_acc < nd && ARGMAX(vlog + (size_t)n_acc * nv) == draft[n_acc]) n_acc++;
+        n_accepted += n_acc;
+
+        bool stop = false;
+        for (int i = 0; i < n_acc; i++) {
+            if (g4_tok_is_eog(tok, draft[i])) { stop = true; break; }
+            char b[256]; int l = g4_tok_decode(tok, draft[i], b, false); u8_emit(&us, b, l);
+            generated++;
+            if (n_gen >= 0 && generated >= n_gen) { stop = true; break; }
+        }
+        // roll both recurrent states back to the accepted prefix (state @ pos+n_acc)
+        if (n_acc < nd) {
+            g4_qwen_state_restore(tgt, n_acc);
+            g4_qwen_state_restore(dft, n_acc);     // draft ckpt[n_acc] = state @ pos+n_acc
+        } else {
+            dft->ck_base = 0;                      // all accepted: advance draft over the last proposal
+            g4_qwen_forward_spec(dft, &draft[nd - 1], 1, pos + nd, dlog);
+        }
+        next_tok = ARGMAX(vlog + (size_t)n_acc * nv);     // bonus
+        pos += n_acc + 1;
+        if (stop || g_interrupt) break;
+    }
+    double tg1 = g4_time_ms();
+    printf("\n");
+    fprintf(stderr, "\ng4: prefill %d tok in %.0f ms (%.2f t/s) | gen %d tok in %.0f ms (%.2f t/s)\n",
+            n_in, tp1 - tp0, n_in * 1000.0 / (tp1 - tp0),
+            generated, tg1 - tg0, generated * 1000.0 / (tg1 - tg0));
+    fprintf(stderr, "g4: self-spec K=%d | %ld rounds, %ld/%ld drafts accepted (%.1f%%), %.2f tokens/round\n",
+            K, n_rounds, n_accepted, n_drafted,
+            n_drafted ? 100.0 * n_accepted / n_drafted : 0.0,
+            n_rounds ? (double)generated / n_rounds : 0.0);
+    (void)verbose;
+    #undef ARGMAX
+    free(vlog); free(dlog); free(batch); free(draft);
+    return 0;
+}
+
 // qwen35 multi-turn interactive chat (recurrent state + KV carry across turns)
 // Copy src->dst with every <think>...</think> reasoning span removed (plus the
 // whitespace immediately following </think>). An unterminated <think> (e.g. the
@@ -694,6 +829,334 @@ static int qwen_chat_loop(qwen_ctx * qc, g4_tok * tok, g4_sampler * smp,
     return 0;
 }
 
+// ============================ pruning M0: eval infra ========================
+// -log softmax(logits)[target] = max + log(sum exp(logits-max)) - logits[target]
+static double g4_nll(const float * logits, int64_t vocab, int target) {
+    float mx = logits[0];
+    for (int64_t i = 1; i < vocab; i++) if (logits[i] > mx) mx = logits[i];
+    double s = 0; for (int64_t i = 0; i < vocab; i++) s += exp((double)(logits[i] - mx));
+    return (double)mx + log(s) - (double)logits[target];
+}
+
+// Perplexity over a raw-text corpus: stream it left-to-right (state/KV carry across
+// G4_BATCH_MAX chunks) and score each next-token prediction. Held-out PPL is the
+// quality gate for the pruning loop.
+static int run_qwen_ppl(qwen_ctx * qc, g4_tok * tok, const char * text, bool add_bos, int n_ctx) {
+    static int ids[1 << 20];
+    int n = g4_tok_encode(tok, text ? text : "", ids, 1 << 20, add_bos, false);
+    if (n < 2) { fprintf(stderr, "g4: perplexity needs >=2 tokens (got %d)\n", n); return 1; }
+    if (n > n_ctx) { fprintf(stderr, "g4: corpus %d tok > ctx %d; truncating\n", n, n_ctx); n = n_ctx; }
+    const int64_t vocab = qc->mf->n_vocab;
+    float * lg = malloc((size_t)G4_BATCH_MAX * vocab * sizeof(float));
+    if (!lg) { fprintf(stderr, "g4: ppl alloc failed\n"); return 1; }
+    g4_qwen_reset(qc);
+    double sum = 0, t0 = g4_time_ms(); long cnt = 0;
+    for (int off = 0; off < n; off += G4_BATCH_MAX) {
+        int nb = n - off < G4_BATCH_MAX ? n - off : G4_BATCH_MAX;
+        g4_qwen_forward_logits(qc, ids + off, nb, off, lg);
+        for (int j = 0; j < nb && off + j + 1 < n; j++) { sum += g4_nll(lg + (size_t)j*vocab, vocab, ids[off+j+1]); cnt++; }
+    }
+    double ms = g4_time_ms() - t0;
+    fprintf(stderr, "g4: perplexity %.4f | mean NLL %.4f | %ld tokens | %.0f ms\n", exp(sum/cnt), sum/cnt, cnt, ms);
+    printf("%.4f\n", exp(sum/cnt));
+    free(lg);
+    return 0;
+}
+static int run_gemma_ppl(g4_ctx * ctx, g4_model_file * mf, g4_tok * tok, const char * text, bool add_bos, int n_ctx) {
+    static int ids[1 << 20];
+    int n = g4_tok_encode(tok, text ? text : "", ids, 1 << 20, add_bos, false);
+    if (n < 2) { fprintf(stderr, "g4: perplexity needs >=2 tokens (got %d)\n", n); return 1; }
+    if (n > n_ctx) { fprintf(stderr, "g4: corpus %d tok > ctx %d; truncating\n", n, n_ctx); n = n_ctx; }
+    const int64_t vocab = mf->n_vocab; const int n_embd = mf->n_embd;
+    float * lg = malloc((size_t)G4_BATCH_MAX * vocab * sizeof(float));
+    float * hn = malloc((size_t)G4_BATCH_MAX * n_embd * sizeof(float));
+    if (!lg || !hn) { fprintf(stderr, "g4: ppl alloc failed\n"); return 1; }
+    double sum = 0, t0 = g4_time_ms(); long cnt = 0;
+    for (int off = 0; off < n; off += G4_BATCH_MAX) {
+        int nb = n - off < G4_BATCH_MAX ? n - off : G4_BATCH_MAX;
+        g4_forward_batch_heads(ctx, ids + off, nb, off, lg, hn);
+        for (int j = 0; j < nb && off + j + 1 < n; j++) { sum += g4_nll(lg + (size_t)j*vocab, vocab, ids[off+j+1]); cnt++; }
+    }
+    double ms = g4_time_ms() - t0;
+    fprintf(stderr, "g4: perplexity %.4f | mean NLL %.4f | %ld tokens | %.0f ms\n", exp(sum/cnt), sum/cnt, cnt, ms);
+    printf("%.4f\n", exp(sum/cnt));
+    free(lg); free(hn);
+    return 0;
+}
+
+// FFN neuron-importance dump (pruning M0): run the corpus capturing per-neuron
+// sum|silu(gate)*up|, combine with ||W_down[:,j]|| into the importance score, and
+// report each layer's prunability. Optional binary dump: [n_layer][n_ff] f32.
+static int run_qwen_prune_stats(qwen_ctx * qc, g4_tok * tok, const char * text, bool add_bos, int n_ctx, const char * outfile) {
+    static int ids[1 << 20];
+    int n = g4_tok_encode(tok, text ? text : "", ids, 1 << 20, add_bos, false);
+    if (n < 2) { fprintf(stderr, "g4: prune-stats needs >=2 tokens (got %d)\n", n); return 1; }
+    if (n > n_ctx) n = n_ctx;
+    if (g4_qwen_ffn_capture_begin(qc)) return 1;
+    g4_qwen_reset(qc);
+    for (int off = 0; off < n; off += G4_BATCH_MAX) {
+        int nb = n - off < G4_BATCH_MAX ? n - off : G4_BATCH_MAX;
+        g4_qwen_forward_batch(qc, ids + off, nb, off, false);   // capture only; no logits
+    }
+    const int n_ff = qc->n_ff, n_embd = qc->mf->n_embd, n_layer = qc->mf->n_layer;
+    float * wn = malloc((size_t)n_ff * sizeof(float));
+    float * dr = malloc((size_t)n_ff * sizeof(float));
+    float * sc = malloc((size_t)n_ff * sizeof(float));
+    FILE * f = outfile ? fopen(outfile, "wb") : NULL;
+    long total_prunable = 0;
+    fprintf(stderr, "g4: FFN importance over %d tokens (score = mean|act| x ||W_down col||)\n", n);
+    fprintf(stderr, "layer   prunable<10%%max   max_score\n");
+    for (int il = 0; il < n_layer; il++) {
+        const g4_tensor * dn = qc->layers[il].ffn_down;
+        size_t rb = g4_row_size(dn->type, n_ff);
+        memset(wn, 0, (size_t)n_ff * sizeof(float));
+        for (int r = 0; r < n_embd; r++) {
+            g4_dequant_row(dn->type, (const uint8_t *)dn->data + (size_t)r*rb, dr, n_ff);
+            for (int j = 0; j < n_ff; j++) wn[j] += dr[j]*dr[j];
+        }
+        float mx = 0;
+        for (int j = 0; j < n_ff; j++) { sc[j] = (qc->ffn_imp[il][j] / (float)n) * sqrtf(wn[j]); if (sc[j] > mx) mx = sc[j]; }
+        int prunable = 0; for (int j = 0; j < n_ff; j++) if (sc[j] < 0.10f*mx) prunable++;
+        total_prunable += prunable;
+        fprintf(stderr, "%3d     %5d/%d (%4.1f%%)     %.4g\n", il, prunable, n_ff, 100.0*prunable/n_ff, mx);
+        if (f) fwrite(sc, sizeof(float), n_ff, f);
+    }
+    fprintf(stderr, "g4: neurons scoring <10%% of layer-max: %ld / %d (%.1f%%)%s\n",
+            total_prunable, n_layer*n_ff, 100.0*total_prunable/(n_layer*(long)n_ff),
+            outfile ? "" : "  (pass --prune-stats <file> to dump full scores)");
+    free(wn); free(dr); free(sc);
+    if (f) fclose(f);
+    g4_qwen_ffn_capture_end(qc);
+    return 0;
+}
+
+// KL(P_ref || P_cur) at one position; ref logits stored f16, cur f32.
+static double g4_kl_f16(const g4_fp16 * ref, const float * cur, int64_t vocab) {
+    float mr = g4_fp16_to_fp32(ref[0]), mc = cur[0];
+    for (int64_t i = 1; i < vocab; i++) { float r = g4_fp16_to_fp32(ref[i]); if (r > mr) mr = r; if (cur[i] > mc) mc = cur[i]; }
+    double sr = 0, sc = 0;
+    for (int64_t i = 0; i < vocab; i++) { sr += exp((double)(g4_fp16_to_fp32(ref[i]) - mr)); sc += exp((double)(cur[i] - mc)); }
+    double lr = log(sr), lc = log(sc), kl = 0;
+    for (int64_t i = 0; i < vocab; i++) {
+        double a = (double)(g4_fp16_to_fp32(ref[i]) - mr) - lr;   // log p_ref
+        double b = (double)(cur[i] - mc) - lc;                    // log p_cur
+        kl += exp(a) * (a - b);
+    }
+    return kl;
+}
+
+// Pruning M1 driver: cache reference logits (for KL) + baseline PPL, capture FFN
+// importance, prune to `keep`, eval pruned PPL + KL-vs-original, optionally export.
+static int run_qwen_prune(qwen_ctx * qc, g4_model_file * mf, g4_tok * tok, const char * text,
+                          bool add_bos, int n_ctx, float keep, int down_quant, int compensate,
+                          const char * out_gguf) {
+    static int ids[1 << 20];
+    int n = g4_tok_encode(tok, text ? text : "", ids, 1 << 20, add_bos, false);
+    if (n > n_ctx) n = n_ctx;
+    const int64_t vocab = qc->mf->n_vocab;
+    bool eval = n >= 2;
+    g4_fp16 * ref = NULL; double base_ppl = 0;
+    float * lg = malloc((size_t)G4_BATCH_MAX * vocab * sizeof(float));
+    if (!lg) { fprintf(stderr, "g4: prune eval alloc failed\n"); return 1; }
+
+    if (eval) {                              // baseline PPL + cache reference logits (f16)
+        ref = malloc((size_t)(n - 1) * vocab * sizeof(g4_fp16));
+        if (!ref) { fprintf(stderr, "g4: ref-logit cache alloc failed (%lld MB)\n", (long long)((n-1)*vocab*2/(1<<20))); return 1; }
+        g4_qwen_reset(qc);
+        double sum = 0; long cnt = 0;
+        for (int off = 0; off < n; off += G4_BATCH_MAX) {
+            int nb = n - off < G4_BATCH_MAX ? n - off : G4_BATCH_MAX;
+            g4_qwen_forward_logits(qc, ids + off, nb, off, lg);
+            for (int j = 0; j < nb && off + j < n - 1; j++) {
+                for (int64_t v = 0; v < vocab; v++) ref[(size_t)(off+j)*vocab + v] = g4_fp32_to_fp16(lg[(size_t)j*vocab + v]);
+                sum += g4_nll(lg + (size_t)j*vocab, vocab, ids[off+j+1]); cnt++;
+            }
+        }
+        base_ppl = exp(sum / cnt);
+        fprintf(stderr, "g4: baseline perplexity %.4f over %ld tokens\n", base_ppl, cnt);
+    }
+
+    g4_qwen_ffn_capture_begin(qc);           // importance over the same corpus
+    g4_qwen_reset(qc);
+    for (int off = 0; off < n; off += G4_BATCH_MAX) {
+        int nb = n - off < G4_BATCH_MAX ? n - off : G4_BATCH_MAX;
+        g4_qwen_forward_batch(qc, ids + off, nb, off, false);
+    }
+    qc->ffn_imp_count = n;                    // tokens, for the mean-compensation normalization
+    int nff0 = qc->n_ff;
+    int nff1 = g4_qwen_prune_ffn(qc, keep, down_quant, compensate);
+    g4_qwen_ffn_capture_end(qc);
+    if (!nff1) return 1;
+    fprintf(stderr, "g4: FFN width %d -> %d (%.0f%% kept), ffn_down -> %s%s\n",
+            nff0, nff1, 100.0*nff1/nff0, g4_type_name(down_quant),
+            compensate == 2 ? ", + blockwise-LS compensation" : compensate == 1 ? ", + mean compensation" : "");
+
+    if (eval) {                              // pruned PPL + KL vs original
+        g4_qwen_reset(qc);
+        double sum = 0, kl = 0; long cnt = 0;
+        for (int off = 0; off < n; off += G4_BATCH_MAX) {
+            int nb = n - off < G4_BATCH_MAX ? n - off : G4_BATCH_MAX;
+            g4_qwen_forward_logits(qc, ids + off, nb, off, lg);
+            for (int j = 0; j < nb && off + j < n - 1; j++) {
+                sum += g4_nll(lg + (size_t)j*vocab, vocab, ids[off+j+1]);
+                kl  += g4_kl_f16(ref + (size_t)(off+j)*vocab, lg + (size_t)j*vocab, vocab);
+                cnt++;
+            }
+        }
+        fprintf(stderr, "g4: perplexity %.4f -> %.4f (%+.1f%%) | mean KL(orig||pruned) %.5f\n",
+                base_ppl, exp(sum/cnt), 100.0*(exp(sum/cnt)-base_ppl)/base_ppl, kl/cnt);
+        free(ref);
+    }
+    free(lg);
+    if (out_gguf) {
+        if (compensate == 1) fprintf(stderr, "g4: NOTE: --export does not write the mean-comp bias; exported model = no-comp prune (use --comp-ls, which folds into ffn_down)\n");
+        if (g4_gguf_write(mf, out_gguf)) return 1;
+        fprintf(stderr, "g4: exported pruned model -> %s\n", out_gguf);
+    }
+    return 0;
+}
+
+// Held-out loss: average next-token NLL over up to 4 non-overlapping windows in the
+// validation region [n_train, n), at the current (unperturbed) adapter weights. This
+// is the honest "is it actually learning" signal — windows the optimizer never trains
+// on. Returns -1 when there is no held-out region (tiny-dataset overfit mode).
+static double ft_val_loss(qwen_ctx * qc, const int * ids, int n_train, int n,
+                          int batch, int64_t vocab, float * lg) {
+    int nw = (n - n_train) / batch;
+    if (nw < 1) return -1;
+    if (nw > 4) nw = 4;
+    double s = 0; int cnt = 0;
+    for (int w = 0; w < nw; w++) {
+        int off = n_train + w * batch;
+        if (off + batch + 1 > n) break;
+        g4_qwen_reset(qc);
+        g4_qwen_forward_logits(qc, ids + off, batch, 0, lg);
+        double ws = 0;
+        for (int j = 0; j < batch; j++) ws += g4_nll(lg + (size_t)j*vocab, vocab, ids[off+j+1]);
+        s += ws / batch; cnt++;
+    }
+    return cnt ? s / cnt : -1;
+}
+
+// MeZO (zeroth-order) LoRA fine-tuning: estimate the gradient of an ffn_down LoRA
+// from two forward passes per step (perturb +eps z, -eps z; step opposite the loss
+// change along z). No backward, no optimizer state — z is regenerated from a seed.
+// Trains on random windows of the first ~90% of the corpus and reports a held-out
+// loss on the last ~10%; with --ft-out, merges the adapter into ffn_down and writes
+// a fine-tuned copy of the model.
+static int run_qwen_finetune(qwen_ctx * qc, g4_tok * tok, const char * path, bool add_bos,
+                             int rank, int steps, float lr, float eps, int l0, int l1,
+                             int batch, float scale, uint64_t seed, const char * ft_out, int ft_eval,
+                             float clip, int q) {
+    FILE * f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "g4: cannot open dataset %s\n", path); return 1; }
+    fseek(f, 0, SEEK_END); long fl = ftell(f); fseek(f, 0, SEEK_SET);
+    char * buf = malloc((size_t)fl + 1);
+    if (fread(buf, 1, fl, f) != (size_t)fl) { fclose(f); free(buf); return 1; }
+    buf[fl] = 0; fclose(f);
+    static int ids[1 << 20];
+    int n = g4_tok_encode(tok, buf, ids, 1 << 20, add_bos, true);   // parse_special: chat markers -> control ids
+    free(buf);
+    if (batch > G4_BATCH_MAX) batch = G4_BATCH_MAX;
+    if (n < batch + 2) { fprintf(stderr, "g4: dataset too small (%d tokens; need >= %d)\n", n, batch + 2); return 1; }
+    if (l1 <= 0 || l1 > qc->mf->n_layer) l1 = qc->mf->n_layer;
+    if (ft_eval < 1) ft_eval = 10;
+    if (q < 1) q = 1;
+    if (clip <= 0) clip = 1e9f;
+    if (g4_qwen_lora_init(qc, rank, l0, l1, scale, seed)) return 1;
+
+    const int64_t vocab = qc->mf->n_vocab;
+    float * lg = malloc((size_t)batch * vocab * sizeof(float));
+    if (!lg) { fprintf(stderr, "g4: ft logits alloc failed\n"); return 1; }
+
+    // train/val split: hold out the last ~10% (>= one window) for validation. Too small
+    // to split -> overfit a single fixed window (the clean-signal demo mode).
+    int n_val = n / 10;
+    if (n_val < batch + 1) n_val = 0;
+    int n_train = n - n_val;
+    int nwin = n_train - batch - 1;
+    int overfit = nwin <= 1;
+    if (overfit) { n_train = n; n_val = 0; nwin = n - batch - 1; if (nwin < 1) nwin = 1; }
+
+    long params = ((long)rank * qc->n_ff + (long)qc->mf->n_embd * rank) * (l1 - l0);
+    fprintf(stderr, "g4: MeZO LoRA finetune | rank=%d layers=[%d,%d) | %ld adapter params\n", rank, l0, l1, params);
+    fprintf(stderr, "g4: %d tokens -> %d train / %d held-out | batch=%d steps=%d lr=%g eps=%g scale=%g clip=%g q=%d | mode=%s\n",
+            n, n_train, n_val, batch, steps, lr, eps, scale, clip, q, overfit ? "overfit(window 0)" : "random-window");
+
+    #define FT_LOSS(OFF) ({ g4_qwen_reset(qc); g4_qwen_forward_logits(qc, ids + (OFF), batch, 0, lg); \
+        double _s = 0; for (int _j = 0; _j < batch; _j++) _s += g4_nll(lg + (size_t)_j*vocab, vocab, ids[(OFF)+_j+1]); _s / batch; })
+
+    // Best-held-out checkpoint: snapshot the adapter whenever the held-out loss improves,
+    // and restore it before merge — so the saved copy is never worse than the base model,
+    // even if the noisy ZO estimate sends a later step uphill.
+    const size_t asz = (size_t)rank * qc->n_ff, bsz = (size_t)qc->mf->n_embd * rank;
+    float * best_a[G4_MAX_LAYERS] = {0}, * best_b[G4_MAX_LAYERS] = {0};
+    int track = n_val > 0;
+    if (track)
+        for (int il = l0; il < l1; il++) { best_a[il] = malloc(asz*sizeof(float)); best_b[il] = malloc(bsz*sizeof(float)); }
+    #define FT_SNAPSHOT() do { if (track) for (int il=l0; il<l1; il++) { \
+        memcpy(best_a[il], qc->lora_a[il], asz*sizeof(float)); memcpy(best_b[il], qc->lora_b[il], bsz*sizeof(float)); } } while (0)
+    #define FT_RESTORE()  do { if (track) for (int il=l0; il<l1; il++) { \
+        memcpy(qc->lora_a[il], best_a[il], asz*sizeof(float)); memcpy(qc->lora_b[il], best_b[il], bsz*sizeof(float)); } } while (0)
+
+    uint64_t rng = seed ? seed : 0xC0FFEEULL;
+    double t0 = g4_time_ms(), l_first = -1, l_ema = -1;
+    double v0 = ft_val_loss(qc, ids, n_train, n, batch, vocab, lg), best_v = v0;
+    FT_SNAPSHOT();                                                  // baseline (B=0) is the floor
+    if (v0 >= 0) fprintf(stderr, "  step   0 | held-out loss %.4f (start)\n", v0);
+    for (int step = 0; step < steps; step++) {
+        rng = rng * 6364136223846793005ULL + 1; int off = overfit ? 0 : (int)((rng >> 33) % nwin);
+        double step_loss = 0, last_grad = 0;
+        for (int qi = 0; qi < q; qi++) {                           // average q perturbation directions
+            rng = rng * 6364136223846793005ULL + 1; uint64_t zs = rng | 1ULL;
+            g4_qwen_lora_perturb(qc, eps, zs);       double Lp = FT_LOSS(off);
+            g4_qwen_lora_perturb(qc, -2.0f*eps, zs); double Lm = FT_LOSS(off);
+            g4_qwen_lora_perturb(qc, eps, zs);                     // restore to theta
+            double grad = (Lp - Lm) / (2.0 * eps);
+            if (grad >  clip) grad =  clip;                        // clip the noisy ZO estimate (anti-runaway)
+            if (grad < -clip) grad = -clip;
+            g4_qwen_lora_perturb(qc, -(float)(lr * grad / q), zs); // averaged step opposite the loss change
+            step_loss += 0.5 * (Lp + Lm); last_grad = grad;
+        }
+        double loss = step_loss / q;
+        l_ema = l_ema < 0 ? loss : 0.8 * l_ema + 0.2 * loss;        // smooth the noisy ZO estimate
+        if (l_first < 0) l_first = l_ema;
+        if (step % 5 == 0 || step == steps - 1)
+            fprintf(stderr, "  step %3d | train %.4f (ema %.4f) | grad %+.3g | %.0fs\n",
+                    step, loss, l_ema, last_grad, (g4_time_ms() - t0) / 1000.0);
+        if (n_val && step > 0 && (step % ft_eval == 0)) {
+            double v = ft_val_loss(qc, ids, n_train, n, batch, vocab, lg);
+            int better = v < best_v;
+            if (better) { best_v = v; FT_SNAPSHOT(); }
+            fprintf(stderr, "  step %3d | held-out loss %.4f%s\n", step, v, better ? "  *best" : "");
+        }
+    }
+    double vf = ft_val_loss(qc, ids, n_train, n, batch, vocab, lg);
+    if (track && vf < best_v) { best_v = vf; FT_SNAPSHOT(); }
+    fprintf(stderr, "g4: finetune done | train ema %.4f -> %.4f%s",
+            l_first, l_ema, vf >= 0 ? "" : " | (no held-out set)\n");
+    if (vf >= 0) fprintf(stderr, " | held-out %.4f -> %.4f (best %.4f)\n", v0, vf, best_v);
+    free(lg);
+
+    int rc = 0;
+    if (ft_out) {                              // persist: restore best adapter, fold into ffn_down, write a copy
+        if (track) {
+            FT_RESTORE();
+            fprintf(stderr, "g4: restored best-held-out adapter (%.4f) for export\n", best_v);
+        }
+        if (g4_qwen_lora_merge(qc)) { rc = 1; }
+        else if (g4_gguf_write(qc->mf, ft_out)) { rc = 1; }
+        else fprintf(stderr, "g4: wrote fine-tuned model -> %s\n", ft_out);
+    } else {
+        fprintf(stderr, "g4: NOTE: adapter is in-memory only; pass --ft-out F.gguf to save a fine-tuned copy\n");
+    }
+    if (track) for (int il = l0; il < l1; il++) { free(best_a[il]); free(best_b[il]); }
+    return rc;
+    #undef FT_LOSS
+    #undef FT_SNAPSHOT
+    #undef FT_RESTORE
+}
+
 // Validated numeric arg parse: error out (instead of silently yielding 0) on
 // garbage like `--spec foo`, or a missing value that swallowed the next flag.
 static long ival(const char * flag, const char * s) {
@@ -758,17 +1221,19 @@ static void log_config(const g4_model_file * mf, const char * model_path, int n_
 int main(int argc, char ** argv) {
     g4_init_tables();
     SetConsoleOutputCP(CP_UTF8);
+    setvbuf(stderr, NULL, _IONBF, 0);   // unbuffered: progress logs stream even when redirected to a file
 
     const char * model_path = NULL;
     const char * prompt = NULL;
     const char * sys_prompt = NULL;
     const char * tokenize_str = NULL;
-    bool interactive = false, raw = false, do_dump = false, do_selftest = false;
+    bool interactive = false, raw = false, do_dump = false, do_selftest = false, fix_llama = false;
     bool verbose = false, parse_special = false, think = false, server = false;
     const char * host = "127.0.0.1";
     const char * mtp_path = NULL;        // gemma4-assistant draft head for spec decoding
     int  draft_len = 0;                  // tokens drafted per round (0 = use nextn_predict_layers)
     int  spec_k = 0;                     // qwen35 prompt-lookup draft length (0 = off)
+    int  draft_quant = 0;                // qwen35 self-spec draft quant (0 = off -> prompt-lookup)
     int  jit_type = 0;                   // JIT requant target (0 = off, else G4_Q4_0/G4_Q8_0)
     int  kv_type_k = G4_F16, kv_type_v = G4_F16;
     int port = 8080;
@@ -778,6 +1243,19 @@ int main(int argc, char ** argv) {
     int top_k = -2, repeat_last_n = 128;
     int  no_repeat_ngram = 0;            // 0 = off; block verbatim n-gram repeats
     const char * ban_str = NULL;         // comma-separated tokens to suppress (anti-loop)
+    bool perplexity = false;             // pruning M0: perplexity eval over -p corpus
+    const char * prune_stats = NULL;     // pruning M0: dump FFN importance (qwen); "" = report only
+    float prune_keep = -1.0f;            // pruning M1: keep fraction (<0 = not requested)
+    int   prune_down = G4_Q8_0;          // ffn_down requant type when pruning
+    int   compensate = 0;                // pruning: 1 = mean/bias (M2), 2 = blockwise LS (M3)
+    int   ls_block = 256;                // blockwise-LS block size
+    const char * export_path = NULL;     // export current (pruned) model to GGUF
+    const char * ft_path = NULL;         // MeZO LoRA finetune dataset (text file)
+    const char * ft_out = NULL;          // write the merged fine-tuned model here
+    // fine-tune defaults = the vetted "standard" recipe (rank-4 LoRA on a narrow middle
+    // band, clipped, q=2) so bare `--finetune F --ft-out G` works well out of the box.
+    int   ft_rank = 4, ft_steps = 40, ft_batch = 64, ft_l0 = 0, ft_l1 = 0, ft_eval = 10, ft_q = 2, ft_band = 1;
+    float ft_lr = 5e-4f, ft_eps = 1e-3f, ft_scale = 1.5f, ft_clip = 6.0f;
     uint64_t seed = (uint64_t)time(NULL);
 
     for (int i = 1; i < argc; i++) {
@@ -805,6 +1283,13 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--mtp"))      mtp_path = NEXT();
         else if (!strcmp(argv[i], "--draft"))    draft_len = (int)ival("--draft", NEXT());
         else if (!strcmp(argv[i], "--spec"))     spec_k = (int)ival("--spec", NEXT());
+        else if (!strcmp(argv[i], "--draft-quant")) {
+            const char * dq = NEXT();
+            if      (!strcmp(dq, "q2_k")) draft_quant = G4_Q2_K;
+            else if (!strcmp(dq, "q3_k")) draft_quant = G4_Q3_K;
+            else if (!strcmp(dq, "q4_0")) draft_quant = G4_Q4_0;
+            else { fprintf(stderr, "g4: --draft-quant expects q2_k | q3_k | q4_0\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--jit-quant")) {
             const char * jt = NEXT();
             if      (!strcmp(jt, "q4_0")) jit_type = G4_Q4_0;
@@ -813,6 +1298,47 @@ int main(int argc, char ** argv) {
             else if (!strcmp(jt, "q3_k")) jit_type = G4_Q3_K;
             else { fprintf(stderr, "g4: --jit-quant expects q4_0 | q8_0 | q3_k | q2_k\n"); return 1; }
         }
+        else if (!strcmp(argv[i], "--perplexity") || !strcmp(argv[i], "--ppl")) perplexity = true;
+        else if (!strcmp(argv[i], "--prune-stats")) prune_stats = NEXT();
+        else if (!strcmp(argv[i], "--prune")) prune_keep = (float)fval("--prune", NEXT());
+        else if (!strcmp(argv[i], "--export")) export_path = NEXT();
+        else if (!strcmp(argv[i], "--compensate")) compensate = 1;
+        else if (!strcmp(argv[i], "--comp-ls"))    compensate = 2;
+        else if (!strcmp(argv[i], "--ls-block"))   ls_block = (int)ival("--ls-block", NEXT());
+        else if (!strcmp(argv[i], "--prune-preset")) {   // easy button: keep-fraction + blockwise-LS + down-quant
+            const char * p = NEXT(); compensate = 2;     // LS = best quality, folds into ffn_down (exports cleanly)
+            if      (!strcmp(p, "light"))      { prune_keep = 0.80f; prune_down = G4_Q8_0; }
+            else if (!strcmp(p, "balanced"))   { prune_keep = 0.70f; prune_down = G4_Q8_0; }
+            else if (!strcmp(p, "aggressive")) { prune_keep = 0.50f; prune_down = G4_Q4_0; }
+            else { fprintf(stderr, "g4: --prune-preset expects light | balanced | aggressive\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--finetune"))   ft_path = NEXT();
+        else if (!strcmp(argv[i], "--ft-preset")) {      // easy button: vetted rank/steps/lr/clip/q + auto band
+            const char * p = NEXT(); ft_clip = 6.0f; ft_scale = 1.5f; ft_eps = 1e-3f; ft_band = 1;
+            if      (!strcmp(p, "quick"))    { ft_rank = 4; ft_steps = 20;  ft_lr = 5e-4f; ft_q = 1; }
+            else if (!strcmp(p, "standard")) { ft_rank = 4; ft_steps = 50;  ft_lr = 5e-4f; ft_q = 2; }
+            else if (!strcmp(p, "thorough")) { ft_rank = 8; ft_steps = 150; ft_lr = 4e-4f; ft_q = 2; }
+            else { fprintf(stderr, "g4: --ft-preset expects quick | standard | thorough\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--ft-rank"))    ft_rank = (int)ival("--ft-rank", NEXT());
+        else if (!strcmp(argv[i], "--ft-steps"))   ft_steps = (int)ival("--ft-steps", NEXT());
+        else if (!strcmp(argv[i], "--ft-batch"))   ft_batch = (int)ival("--ft-batch", NEXT());
+        else if (!strcmp(argv[i], "--ft-lr"))      ft_lr = (float)fval("--ft-lr", NEXT());
+        else if (!strcmp(argv[i], "--ft-eps"))     ft_eps = (float)fval("--ft-eps", NEXT());
+        else if (!strcmp(argv[i], "--ft-scale"))   ft_scale = (float)fval("--ft-scale", NEXT());
+        else if (!strcmp(argv[i], "--ft-out"))     ft_out = NEXT();
+        else if (!strcmp(argv[i], "--ft-eval"))    ft_eval = (int)ival("--ft-eval", NEXT());
+        else if (!strcmp(argv[i], "--ft-clip"))    ft_clip = (float)fval("--ft-clip", NEXT());
+        else if (!strcmp(argv[i], "--ft-q"))       ft_q = (int)ival("--ft-q", NEXT());
+        else if (!strcmp(argv[i], "--ft-layers"))  { const char * a = NEXT(); ft_l0 = atoi(a); const char * cc = strchr(a, ':'); ft_l1 = cc ? atoi(cc+1) : 0; ft_band = 0; }
+        else if (!strcmp(argv[i], "--prune-down")) {
+            const char * t = NEXT();
+            if      (!strcmp(t, "q8_0")) prune_down = G4_Q8_0;
+            else if (!strcmp(t, "q4_0")) prune_down = G4_Q4_0;
+            else if (!strcmp(t, "q3_k")) prune_down = G4_Q3_K;
+            else if (!strcmp(t, "q2_k")) prune_down = G4_Q2_K;
+            else { fprintf(stderr, "g4: --prune-down expects q8_0|q4_0|q3_k|q2_k\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "--cache-type-k") || !strcmp(argv[i], "-ctk")) kv_type_k = kv_type_parse(NEXT());
         else if (!strcmp(argv[i], "--cache-type-v") || !strcmp(argv[i], "-ctv")) kv_type_v = kv_type_parse(NEXT());
         else if (!strcmp(argv[i], "--no-avx512")) g4_set_avx512(0);
@@ -820,6 +1346,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--no-bos"))   bos_override = 0;
         else if (!strcmp(argv[i], "--bos"))      bos_override = 1;
         else if (!strcmp(argv[i], "--dump"))     do_dump = true;
+        else if (!strcmp(argv[i], "--fix-llama")) fix_llama = true;
         else if (!strcmp(argv[i], "--selftest")) do_selftest = true;
         else if (!strcmp(argv[i], "--list-gpu")) { extern int g4_vk_list(void); return g4_vk_list(); }
         else if (!strcmp(argv[i], "--gpu-test")) { extern int g4_vk_test(const char *); return g4_vk_test(NEXT()); }
@@ -849,12 +1376,36 @@ int main(int argc, char ** argv) {
 
     double t0 = g4_time_ms();
     g4_model_file mf;
+    g4_mmap_cow = 0;   // CPU path: read-only mmap (no pagefile commit charge; Vulkan --gpu-test maps its own COW view earlier)
     if (g4_gguf_open(&mf, model_path, verbose)) return 1;
     if (verbose) fprintf(stderr, "g4: header parsed in %.1f ms\n", g4_time_ms() - t0);
 
     if (do_dump) {
         g4_gguf_dump(&mf);
         g4_gguf_close(&mf);
+        return 0;
+    }
+
+    // --fix-llama: patch feed_forward_length metadata in place to match the (pruned) FFN
+    // tensors, so an already-exported pruned model loads in llama.cpp. Fast (4-byte write).
+    if (fix_llama) {
+        const g4_tensor * g = g4_find_tensor(&mf, "blk.0.ffn_gate.weight");
+        int64_t new_ff = g ? g->ne[1] : 0;
+        int oldv = mf.n_ff[0]; uint64_t off = mf.ff_len_off;
+        if (!off)        { fprintf(stderr, "g4: --fix-llama: no qwen35.feed_forward_length metadata (qwen35 only)\n"); g4_gguf_close(&mf); return 1; }
+        if (new_ff <= 0) { fprintf(stderr, "g4: --fix-llama: ffn_gate tensor not found\n"); g4_gguf_close(&mf); return 1; }
+        if (oldv == (int)new_ff) { fprintf(stderr, "g4: --fix-llama: metadata already matches tensors (feed_forward_length=%lld)\n", (long long)new_ff); g4_gguf_close(&mf); return 0; }
+        uint32_t cur_meta = 0; memcpy(&cur_meta, (const uint8_t *)mf.map_base + off, 4);   // self-check the offset
+        if ((int)cur_meta != oldv) { fprintf(stderr, "g4: --fix-llama: offset self-check failed (got %u at +%llu, expected %d); aborting\n", cur_meta, (unsigned long long)off, oldv); g4_gguf_close(&mf); return 1; }
+        g4_gguf_close(&mf);                              // release the mapping before reopening for write
+        FILE * f = fopen(model_path, "r+b");
+        if (!f) { fprintf(stderr, "g4: --fix-llama: cannot open %s for writing\n", model_path); return 1; }
+        _fseeki64(f, (long long)off, SEEK_SET);
+        uint32_t v = (uint32_t)new_ff; int ok = fwrite(&v, 4, 1, f) == 1;
+        fclose(f);
+        if (!ok) { fprintf(stderr, "g4: --fix-llama: write failed\n"); return 1; }
+        fprintf(stderr, "g4: patched %s: feed_forward_length %d -> %lld (now llama.cpp-compatible)\n",
+                base_name(model_path), oldv, (long long)new_ff);
         return 0;
     }
 
@@ -922,6 +1473,28 @@ int main(int argc, char ** argv) {
         qwen_ctx qc;
         if (g4_qwen_init(&qc, &mf, n_ctx, n_threads)) return 1;
         int rc = 0;
+        if (ft_path) {                          // MeZO LoRA fine-tuning
+            if (ft_band && ft_l0 == 0 && ft_l1 == 0) {   // auto: adapt a narrow middle band (lower ZO variance)
+                ft_l0 = 7 * mf.n_layer / 16; ft_l1 = 9 * mf.n_layer / 16;
+                if (ft_l1 <= ft_l0) { ft_l0 = 0; ft_l1 = mf.n_layer; }
+            }
+            rc = run_qwen_finetune(&qc, tok, ft_path, add_bos, ft_rank, ft_steps, ft_lr, ft_eps, ft_l0, ft_l1, ft_batch, ft_scale, seed, ft_out, ft_eval, ft_clip, ft_q);
+            g4_qwen_free(&qc); g4_tok_free(tok); g4_gguf_close(&mf);
+            return rc;
+        }
+        if (perplexity || prune_stats) {        // pruning M0 eval modes
+            rc = perplexity ? run_qwen_ppl(&qc, tok, prompt, add_bos, n_ctx)
+                            : run_qwen_prune_stats(&qc, tok, prompt, add_bos, n_ctx, prune_stats[0] ? prune_stats : NULL);
+            g4_qwen_free(&qc); g4_tok_free(tok); g4_gguf_close(&mf);
+            return rc;
+        }
+        if (prune_keep >= 0 || export_path) {   // pruning: prune + KL/PPL + export
+            if (compensate == 2) qc.cov_block = ls_block;   // capture block covariances for LS
+            rc = run_qwen_prune(&qc, &mf, tok, prompt, add_bos, n_ctx,
+                                prune_keep >= 0 ? prune_keep : 1.0f, prune_down, compensate, export_path);
+            g4_qwen_free(&qc); g4_tok_free(tok); g4_gguf_close(&mf);
+            return rc;
+        }
         if (server) {
             rc = g4_server_run(&qc, 1, tok, &mf, host, port, base_name(model_path),
                                repeat_penalty, no_repeat_ngram, ban_str);
@@ -938,6 +1511,13 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "g4: sampling temp=%.2f top_k=%d top_p=%.2f repeat_penalty=%.2f no_repeat_ngram=%d banned=%d tok\n",
                     smp.temp, smp.top_k, smp.top_p, smp.repeat_penalty, smp.no_repeat_ngram, smp.n_ban);
             if (interactive)     rc = qwen_chat_loop(&qc, tok, &smp, sys_prompt, n_ctx, verbose);
+            else if (spec_k > 0 && draft_quant) {
+                qwen_ctx dft;
+                fprintf(stderr, "g4: building %s self-spec draft...\n", g4_type_name(draft_quant));
+                if (g4_qwen_make_draft(&dft, &mf, draft_quant, n_ctx, n_threads)) { rc = 1; }
+                else { rc = run_qwen_spec_model(&qc, &dft, tok, prompt, raw, sys_prompt, n_gen, n_ctx, spec_k, parse_special, verbose);
+                       g4_qwen_free(&dft); }
+            }
             else if (spec_k > 0) rc = run_qwen_spec(&qc, tok, prompt, raw, sys_prompt, n_gen, n_ctx, spec_k, parse_special, verbose);
             else                 rc = run_qwen(&qc, tok, &smp, prompt, raw, sys_prompt, n_gen, n_ctx, parse_special, verbose);
             g4_sampler_free(&smp);
@@ -952,6 +1532,13 @@ int main(int argc, char ** argv) {
     if (g4_ctx_init(&ctx, &mf, n_ctx, n_threads, kv_type_k, kv_type_v)) return 1;
     if (verbose && (kv_type_k != G4_F16 || kv_type_v != G4_F16))
         fprintf(stderr, "g4: KV cache K=%s V=%s\n", g4_type_name(kv_type_k), g4_type_name(kv_type_v));
+
+    if (perplexity) {                       // pruning M0 eval (prune-stats is qwen-only for now)
+        int rc = run_gemma_ppl(&ctx, &mf, tok, prompt, add_bos, n_ctx);
+        g4_ctx_free(&ctx); g4_tok_free(tok); g4_gguf_close(&mf);
+        return rc;
+    }
+    if (prune_stats) fprintf(stderr, "g4: --prune-stats is qwen35-only for now; ignoring\n");
 
     if (server) {
         int rc = g4_server_run(&ctx, 0, tok, &mf, host, port, base_name(model_path),

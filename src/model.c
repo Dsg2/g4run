@@ -1019,6 +1019,9 @@ int g4_qwen_init(qwen_ctx * c, g4_model_file * mf, int n_ctx, int n_threads) {
             if (!c->kc[il] || !c->vc[il]) { fprintf(stderr, "g4: qwen kv alloc\n"); return 1; }
         }
     }
+    // Derive n_ff from the ffn_gate tensor shape (ne[1] = output width), so a pruned
+    // model with a smaller FFN loads correctly even though the metadata scalar is stale.
+    c->n_ff = (int)c->layers[0].ffn_gate->ne[1];
 
     // scratch (token-major, B rows for batched prefill)
     const int B = G4_BATCH_MAX;
@@ -1071,7 +1074,8 @@ void g4_qwen_free(qwen_ctx * c) {
     g4_threads_stop();
     for (int il = 0; il < G4_MAX_LAYERS; il++) {
         free(c->kc[il]); free(c->vc[il]); free(c->conv_state[il]); free(c->ssm_state[il]);
-        free(c->ck_conv[il]); free(c->ck_ssm[il]);
+        free(c->ck_conv[il]); free(c->ck_ssm[il]); free(c->ffn_imp[il]); free(c->ffn_mean[il]);
+        free(c->ffn_bias[il]); free(c->ffn_cov[il]); free(c->lora_a[il]); free(c->lora_b[il]);
     }
     free(c->x); free(c->xb); free(c->cur); free(c->tmp); free(c->qkv); free(c->convo);
     free(c->qfull); free(c->kb); free(c->vb); free(c->attno); free(c->z);
@@ -1131,7 +1135,7 @@ static void qconv_kernel(int64_t c0, int64_t c1, void * p, int tid) {
             for (int i = 0; i < dc - 2; i++) st[i] = st[i + 1];
             st[dc - 2] = in;
             if (ck)   // checkpoint this channel's conv window after ingesting token b
-                memcpy(c->ck_conv[u->il] + (size_t)b * c->ck_stride_conv + (size_t)ch * (dc - 1),
+                memcpy(c->ck_conv[u->il] + (size_t)(c->ck_base + b) * c->ck_stride_conv + (size_t)ch * (dc - 1),
                        st, (size_t)(dc - 1) * sizeof(float));
         }
     }
@@ -1161,7 +1165,7 @@ static void qscan_kernel(int64_t h0, int64_t h1, void * p, int tid) {
             for (int j = 0; j < sv; j++)
                 o[j] = vdot(S + (size_t)j * sv, q_h, sv) * oscale;
             if (c->ck_on)   // checkpoint this head's recurrent state after ingesting token b
-                memcpy(c->ck_ssm[u->il] + (size_t)b * c->ck_stride_ssm + (size_t)h * sv * sv,
+                memcpy(c->ck_ssm[u->il] + (size_t)(c->ck_base + b) * c->ck_stride_ssm + (size_t)h * sv * sv,
                        S, (size_t)sv * sv * sizeof(float));
         }
     }
@@ -1284,7 +1288,43 @@ static void qwen_run_layers(qwen_ctx * c, const int * tokens, int nb, int pos0) 
             QMM(c, L->ffn_up,   c->cur, c->ffh2, n_embd, n_ff, nb);
         }
         for (int64_t i = 0; i < (int64_t)nb*n_ff; i++) c->ffh[i] = qsilu(c->ffh[i]) * c->ffh2[i];
+        if (c->ffn_capture && c->ffn_imp[il])   // per neuron: sum|a_j| (importance) + sum a_j (mean)
+            for (int b = 0; b < nb; b++)
+                for (int j = 0; j < n_ff; j++) {
+                    float a = c->ffh[(size_t)b*n_ff + j];
+                    c->ffn_imp[il][j]  += fabsf(a);
+                    c->ffn_mean[il][j] += a;
+                }
+        if (c->ffn_cov[il]) {                    // block activation covariances (blockwise LS)
+            const int B = c->cov_block, nbk = n_ff / B;
+            for (int b = 0; b < nb; b++) {
+                const float * a = c->ffh + (size_t)b*n_ff;
+                for (int bl = 0; bl < nbk; bl++) {
+                    const float * ab = a + (size_t)bl*B;
+                    float * cv = c->ffn_cov[il] + (size_t)bl*B*B;
+                    for (int u = 0; u < B; u++) {
+                        float au = ab[u]; if (au == 0.0f) continue;
+                        float * row = cv + (size_t)u*B;
+                        for (int v = 0; v < B; v++) row[v] += au * ab[v];
+                    }
+                }
+            }
+        }
         QMM(c, L->ffn_down, c->ffh, c->cur, n_ff, n_embd, nb);
+        if (c->ffn_bias[il])                    // mean compensation for pruned neurons
+            for (int b = 0; b < nb; b++)
+                for (int i = 0; i < n_embd; i++) c->cur[(size_t)b*n_embd + i] += c->ffn_bias[il][i];
+        if (c->lora_rank && il >= c->lora_l0 && il < c->lora_l1 && c->lora_a[il]) {  // MeZO LoRA: cur += scale*B*(A*ffh)
+            const int R = c->lora_rank;
+            const float * A = c->lora_a[il], * Bm = c->lora_b[il];
+            for (int b = 0; b < nb; b++) {
+                const float * xf = c->ffh + (size_t)b*n_ff;
+                float ax[64];
+                for (int r = 0; r < R; r++) { const float * Ar = A + (size_t)r*n_ff; float s = 0; for (int j = 0; j < n_ff; j++) s += Ar[j]*xf[j]; ax[r] = s; }
+                float * y = c->cur + (size_t)b*n_embd;
+                for (int e = 0; e < n_embd; e++) { float s = 0; for (int r = 0; r < R; r++) s += Bm[(size_t)e*R + r]*ax[r]; y[e] += c->lora_scale * s; }
+            }
+        }
         for (int64_t i = 0; i < (int64_t)nb*n_embd; i++) c->x[i] = c->tmp[i] + c->cur[i];
     }
 }
@@ -1337,6 +1377,328 @@ float * g4_qwen_forward_spec(qwen_ctx * c, const int * tokens, int nb, int pos0,
     return logits_out;
 }
 
+// FFN neuron-importance capture (pruning M0): allocate per-layer accumulators and
+// enable accumulation of sum|silu(gate)*up| per intermediate unit in qwen_run_layers.
+int g4_qwen_ffn_capture_begin(qwen_ctx * c) {
+    const int B = c->cov_block;                              // >0 enables block covariances (LS)
+    const size_t cov_sz = B > 0 ? (size_t)(c->n_ff / B) * B * B : 0;
+    for (int il = 0; il < c->mf->n_layer; il++) {
+        c->ffn_imp[il]  = calloc((size_t)c->n_ff, sizeof(float));
+        c->ffn_mean[il] = calloc((size_t)c->n_ff, sizeof(float));
+        if (cov_sz) c->ffn_cov[il] = calloc(cov_sz, sizeof(float));
+        if (!c->ffn_imp[il] || !c->ffn_mean[il] || (cov_sz && !c->ffn_cov[il])) {
+            fprintf(stderr, "g4: ffn capture alloc failed\n"); return 1;
+        }
+    }
+    c->ffn_imp_count = 0;
+    c->ffn_capture = 1;
+    return 0;
+}
+void g4_qwen_ffn_capture_end(qwen_ctx * c) {
+    c->ffn_capture = 0;
+    for (int il = 0; il < c->mf->n_layer; il++) {
+        free(c->ffn_imp[il]);  c->ffn_imp[il]  = NULL;
+        free(c->ffn_mean[il]); c->ffn_mean[il] = NULL;
+        free(c->ffn_cov[il]);  c->ffn_cov[il]  = NULL;
+    }
+}
+
+// ---- zeroth-order (MeZO) LoRA fine-tuning ----------------------------------
+// One N(0,1) sample (Box-Muller) advancing a splitmix64 state. Regenerating the
+// same gaussian sequence from a fixed seed is what lets MeZO avoid storing the
+// perturbation direction (no gradients / optimizer state).
+static inline float g4_randn(uint64_t * st) {
+    *st = *st * 6364136223846793005ULL + 1442695040888963407ULL; uint64_t a = *st;
+    *st = *st * 6364136223846793005ULL + 1442695040888963407ULL; uint64_t b = *st;
+    double u1 = ((a >> 11) + 1) / 9007199254740993.0, u2 = (b >> 11) / 9007199254740992.0;
+    return (float)(sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2));
+}
+int g4_qwen_lora_init(qwen_ctx * c, int rank, int l0, int l1, float scale, uint64_t seed) {
+    if (rank < 1 || rank > 64) { fprintf(stderr, "g4: lora rank 1..64\n"); return 1; }
+    c->lora_rank = rank; c->lora_l0 = l0; c->lora_l1 = l1; c->lora_scale = scale;
+    const int n_ff = c->n_ff, n_embd = c->mf->n_embd;
+    const float std = 1.0f / sqrtf((float)n_ff);
+    uint64_t st = seed ? seed : 0x9e3779b97f4a7c15ULL;
+    for (int il = l0; il < l1 && il < c->mf->n_layer; il++) {
+        c->lora_a[il] = malloc((size_t)rank * n_ff * sizeof(float));
+        c->lora_b[il] = calloc((size_t)n_embd * rank, sizeof(float));   // B = 0 -> initial delta 0
+        if (!c->lora_a[il] || !c->lora_b[il]) { fprintf(stderr, "g4: lora alloc failed\n"); return 1; }
+        for (size_t i = 0; i < (size_t)rank * n_ff; i++) c->lora_a[il][i] = std * g4_randn(&st);
+    }
+    return 0;
+}
+// Add coef * z to every adapter parameter, where z ~ N(0,1) is regenerated from `seed`
+// in a fixed order — so +eps, -2eps, +eps and the final update all use the same z.
+void g4_qwen_lora_perturb(qwen_ctx * c, float coef, uint64_t seed) {
+    const size_t na = (size_t)c->lora_rank * c->n_ff, nb = (size_t)c->mf->n_embd * c->lora_rank;
+    uint64_t st = seed;
+    for (int il = c->lora_l0; il < c->lora_l1 && il < c->mf->n_layer; il++) {
+        float * A = c->lora_a[il], * B = c->lora_b[il];
+        for (size_t i = 0; i < na; i++) A[i] += coef * g4_randn(&st);
+        for (size_t i = 0; i < nb; i++) B[i] += coef * g4_randn(&st);
+    }
+}
+
+// types we have an f32->quant encoder for (others fall back to Q8_0 on re-encode)
+static int qwen_requant_supported(int t) {
+    return t == G4_Q8_0 || t == G4_Q4_0 || t == G4_Q2_K || t == G4_Q3_K;
+}
+static void qwen_requant_row(uint8_t * dst, int type, const float * src, int n) {
+    switch (type) {
+        case G4_Q8_0: g4_quantize_q8_0(src, (block_q8_0 *)dst, n); break;
+        case G4_Q4_0: g4_quantize_q4_0(src, (block_q4_0 *)dst, n); break;
+        case G4_Q2_K: g4_quantize_q2_K(src, (block_q2_K *)dst, n); break;
+        default:      g4_quantize_q3_K(src, (block_q3_K *)dst, n); break;
+    }
+}
+
+// Fold the trained LoRA delta into ffn_down so the fine-tune survives export. For each
+// adapted layer: dequantize ffn_down (n_embd output rows x n_ff cols), add the rank-R
+// update delta[e][j] = scale * sum_r B[e][r]*A[r][j], then re-quantize. The down tensor
+// is repointed to the new heap buffer (same n_ff shape, so a merged GGUF still loads in
+// llama.cpp). The adapter is freed and disabled afterwards so the in-memory forward path
+// matches the merged weights (no double application). Returns 0 on success.
+int g4_qwen_lora_merge(qwen_ctx * c) {
+    if (!c->lora_rank) { fprintf(stderr, "g4: lora_merge: no adapter to merge\n"); return 1; }
+    const int R = c->lora_rank, n_ff = c->n_ff, n_embd = c->mf->n_embd;
+    float * f  = malloc((size_t)n_ff * sizeof(float));   // dequantized W_down row
+    float * dl = malloc((size_t)n_ff * sizeof(float));   // delta row
+    if (!f || !dl) { fprintf(stderr, "g4: lora_merge alloc failed\n"); free(f); free(dl); return 1; }
+    int merged = 0, recoded = 0;
+    for (int il = c->lora_l0; il < c->lora_l1 && il < c->mf->n_layer; il++) {
+        if (!c->lora_a[il]) continue;
+        g4_tensor * down = (g4_tensor *)c->layers[il].ffn_down;
+        const size_t drb = g4_row_size(down->type, n_ff);
+        const int    dt  = qwen_requant_supported(down->type) ? down->type : G4_Q8_0;
+        if (dt != down->type) recoded++;
+        const size_t ndrb = g4_row_size(dt, n_ff);
+        uint8_t * nd = malloc((size_t)n_embd * ndrb);
+        if (!nd) { fprintf(stderr, "g4: lora_merge layer alloc failed\n"); free(f); free(dl); return 1; }
+        const float * A = c->lora_a[il], * Bm = c->lora_b[il];
+        for (int e = 0; e < n_embd; e++) {
+            g4_dequant_row(down->type, (const uint8_t *)down->data + (size_t)e*drb, f, n_ff);
+            const float * be = Bm + (size_t)e*R;
+            for (int j = 0; j < n_ff; j++) dl[j] = 0.0f;
+            for (int r = 0; r < R; r++) {
+                float br = c->lora_scale * be[r];
+                if (br == 0.0f) continue;
+                const float * Ar = A + (size_t)r*n_ff;
+                for (int j = 0; j < n_ff; j++) dl[j] += br * Ar[j];
+            }
+            for (int j = 0; j < n_ff; j++) f[j] += dl[j];
+            qwen_requant_row(nd + (size_t)e*ndrb, dt, f, n_ff);
+        }
+        down->data = nd; down->type = dt;                 // ne unchanged (same n_ff)
+        merged++;
+    }
+    for (int il = 0; il < c->mf->n_layer; il++) {          // disable + free the adapter
+        free(c->lora_a[il]); c->lora_a[il] = NULL;
+        free(c->lora_b[il]); c->lora_b[il] = NULL;
+    }
+    c->lora_rank = 0;
+    free(f); free(dl);
+    fprintf(stderr, "g4: merged LoRA into %d ffn_down tensors%s\n", merged,
+            recoded ? " (re-encoded q4_K/q5_K/q6_K -> Q8_0)" : "");
+    return 0;
+}
+
+// ---- structured FFN-width pruning (pruning M1) -----------------------------
+static const float * g_prune_sc;
+static int prune_cmp_desc(const void * a, const void * b) {
+    float sa = g_prune_sc[*(const int *)a], sb = g_prune_sc[*(const int *)b];
+    return sa < sb ? 1 : sa > sb ? -1 : 0;
+}
+static int int_cmp_asc(const void * a, const void * b) { return *(const int *)a - *(const int *)b; }
+
+// Solve (A + ridge*I) X = B for symmetric PD A (n x n, stride n) and B (n x m, stride m);
+// X overwrites B. In-place Cholesky + forward/back substitution. Returns 1 if not PD.
+static int chol_solve(float * A, int n, float * B, int m, float ridge) {
+    for (int i = 0; i < n; i++) A[(size_t)i*n + i] += ridge;
+    for (int j = 0; j < n; j++) {
+        double d = A[(size_t)j*n + j];
+        for (int k = 0; k < j; k++) { double v = A[(size_t)j*n + k]; d -= v*v; }
+        if (d <= 1e-12) return 1;
+        double ljj = sqrt(d); A[(size_t)j*n + j] = (float)ljj;
+        for (int i = j+1; i < n; i++) {
+            double s = A[(size_t)i*n + j];
+            for (int k = 0; k < j; k++) s -= (double)A[(size_t)i*n + k] * A[(size_t)j*n + k];
+            A[(size_t)i*n + j] = (float)(s / ljj);
+        }
+    }
+    for (int c = 0; c < m; c++) {
+        for (int i = 0; i < n; i++) {                       // L y = b
+            double s = B[(size_t)i*m + c];
+            for (int k = 0; k < i; k++) s -= (double)A[(size_t)i*n + k] * B[(size_t)k*m + c];
+            B[(size_t)i*m + c] = (float)(s / A[(size_t)i*n + i]);
+        }
+        for (int i = n-1; i >= 0; i--) {                    // Lᵀ x = y
+            double s = B[(size_t)i*m + c];
+            for (int k = i+1; k < n; k++) s -= (double)A[(size_t)k*n + i] * B[(size_t)k*m + c];
+            B[(size_t)i*m + c] = (float)(s / A[(size_t)i*n + i]);
+        }
+    }
+    return 0;
+}
+
+// Blockwise least-squares compensation: for each block of B neurons, re-fit the kept
+// neurons' down weights to reconstruct the block's full (kept+dropped) output
+// contribution over the calibration set, using the captured block covariance `cov`
+// and the dequantized down weights `Wd` (n_embd x n_ff0). Writes the adjusted kept
+// down columns into newdf (n_embd x n_keep, row-major). Drops cross-block correlation.
+static void qwen_blockwise_ls(const float * cov, int B, const float * Wd, int n_ff0, int n_embd,
+                              const uint8_t * kept, const int * keptpos, int n_keep, float * newdf) {
+    const int nbk = n_ff0 / B;
+    int   * sl  = malloc((size_t)B * sizeof(int));
+    float * A   = malloc((size_t)B * B * sizeof(float));
+    float * Wdb = malloc((size_t)B * n_embd * sizeof(float));
+    float * Bbt = malloc((size_t)B * n_embd * sizeof(float));
+    for (int bl = 0; bl < nbk; bl++) {
+        const float * cv = cov + (size_t)bl*B*B;
+        int sb = 0;
+        for (int l = 0; l < B; l++) if (kept[bl*B + l]) sl[sb++] = l;
+        if (sb == 0) continue;                              // whole block dropped (rare): lost
+        for (int l = 0; l < B; l++)                          // Wdb[l][d] = Wd[d][bl*B+l]
+            for (int d = 0; d < n_embd; d++)
+                Wdb[(size_t)l*n_embd + d] = Wd[(size_t)d*n_ff0 + bl*B + l];
+        for (int a = 0; a < sb; a++) {                       // Bbt = G[S_b, P_b] . Wdb  (sb x n_embd)
+            const float * crow = cv + (size_t)sl[a]*B;
+            float * out = Bbt + (size_t)a*n_embd;
+            for (int d = 0; d < n_embd; d++) out[d] = 0.0f;
+            for (int l = 0; l < B; l++) {
+                float g = crow[l]; if (g == 0.0f) continue;
+                const float * wl = Wdb + (size_t)l*n_embd;
+                for (int d = 0; d < n_embd; d++) out[d] += g * wl[d];
+            }
+        }
+        double dsum = 0;                                     // A = G[S_b, S_b]  (sb x sb)
+        for (int a = 0; a < sb; a++) { for (int b2 = 0; b2 < sb; b2++) A[(size_t)a*sb + b2] = cv[(size_t)sl[a]*B + sl[b2]]; dsum += A[(size_t)a*sb + a]; }
+        float ridge = (float)(1e-3 * dsum / sb);
+        int fail = chol_solve(A, sb, Bbt, n_embd, ridge);    // Bbt <- W_new^T (sb x n_embd)
+        for (int a = 0; a < sb; a++) {                       // scatter to the kept columns
+            int o = bl*B + sl[a], kk = keptpos[o];
+            for (int d = 0; d < n_embd; d++)
+                newdf[(size_t)d*n_keep + kk] = fail ? Wd[(size_t)d*n_ff0 + o] : Bbt[(size_t)a*n_embd + d];
+        }
+    }
+    free(sl); free(A); free(Wdb); free(Bbt);
+}
+
+// Keep the top `keep` fraction of FFN neurons by importance (captured mean|act| x
+// ||W_down col||), uniformly per layer. ffn_gate/up keep their selected quantized
+// rows verbatim (lossless); ffn_down is dequantized, kept columns gathered, and
+// re-quantized to `down_quant`. With compensate=1, the dropped neurons' mean
+// contribution sum_{j in D} E[a_j] W_down[:,j] is added back as a per-layer bias
+// (M2 mean compensation). Tensors are resized + repointed in place. Returns new n_ff.
+int g4_qwen_prune_ffn(qwen_ctx * c, float keep, int down_quant, int compensate) {
+    const int n_ff0 = c->n_ff, n_embd = c->mf->n_embd, n_layer = c->mf->n_layer;
+    int n_keep = ((int)(keep * n_ff0 + 0.5f) / 256) * 256;        // block-align (all quant types)
+    if (n_keep < 256) n_keep = 256;
+    if (n_keep >= n_ff0) return n_ff0;                            // nothing to remove
+    const size_t dn_rb = g4_row_size(down_quant, n_keep);
+    if (!dn_rb) { fprintf(stderr, "g4: prune: bad down_quant\n"); return 0; }
+    const double inv_cnt = c->ffn_imp_count ? 1.0 / (double)c->ffn_imp_count : 0.0;
+    if (compensate && inv_cnt == 0.0) { fprintf(stderr, "g4: compensate needs captured stats; disabling\n"); compensate = 0; }
+    if (compensate == 2 && c->cov_block <= 0) { fprintf(stderr, "g4: blockwise LS needs covariance capture; falling back to no-comp\n"); compensate = 0; }
+    float   * f = malloc((size_t)n_ff0 * sizeof(float));
+    float   * k = malloc((size_t)n_keep * sizeof(float));
+    float   * score = malloc((size_t)n_ff0 * sizeof(float));
+    int     * idx = malloc((size_t)n_ff0 * sizeof(int));
+    uint8_t * kept = malloc((size_t)n_ff0);
+    // blockwise-LS scratch (compensate==2): full dequantized down + new kept down + map
+    float   * Wd     = compensate == 2 ? malloc((size_t)n_embd * n_ff0  * sizeof(float)) : NULL;
+    float   * newdf  = compensate == 2 ? malloc((size_t)n_embd * n_keep * sizeof(float)) : NULL;
+    int     * keptpos= compensate == 2 ? malloc((size_t)n_ff0 * sizeof(int)) : NULL;
+    if (!f || !k || !score || !idx || !kept || (compensate == 2 && (!Wd || !newdf || !keptpos))) {
+        fprintf(stderr, "g4: prune alloc failed\n"); return 0; }
+
+    for (int il = 0; il < n_layer; il++) {
+        g4_tensor * gate = (g4_tensor *)c->layers[il].ffn_gate;
+        g4_tensor * up   = (g4_tensor *)c->layers[il].ffn_up;
+        g4_tensor * down = (g4_tensor *)c->layers[il].ffn_down;
+        const size_t drb = g4_row_size(down->type, n_ff0);
+        // importance(j) = sum|act_j| * ||W_down[:,j]||  (count cancels for ranking)
+        for (int j = 0; j < n_ff0; j++) score[j] = 0;
+        for (int r = 0; r < n_embd; r++) {
+            g4_dequant_row(down->type, (const uint8_t *)down->data + (size_t)r*drb, f, n_ff0);
+            for (int j = 0; j < n_ff0; j++) score[j] += f[j]*f[j];
+        }
+        for (int j = 0; j < n_ff0; j++) { score[j] = (c->ffn_imp[il] ? c->ffn_imp[il][j] : 1.0f) * sqrtf(score[j]); idx[j] = j; }
+        g_prune_sc = score;
+        qsort(idx, n_ff0, sizeof(int), prune_cmp_desc);          // rank by importance
+        qsort(idx, n_keep, sizeof(int), int_cmp_asc);            // kept set, ascending order
+        memset(kept, 0, (size_t)n_ff0);
+        for (int kk = 0; kk < n_keep; kk++) kept[idx[kk]] = 1;
+        float * bias = compensate == 1 ? calloc((size_t)n_embd, sizeof(float)) : NULL;
+        // ffn_gate / ffn_up: copy the kept rows' quantized bytes verbatim
+        const size_t grb = g4_row_size(gate->type, n_embd), urb = g4_row_size(up->type, n_embd);
+        uint8_t * ng = malloc((size_t)n_keep * grb), * nu = malloc((size_t)n_keep * urb);
+        uint8_t * nd = malloc((size_t)n_embd * dn_rb);
+        if (!ng || !nu || !nd) { fprintf(stderr, "g4: prune layer alloc failed\n"); return 0; }
+        for (int kk = 0; kk < n_keep; kk++) {
+            memcpy(ng + (size_t)kk*grb, (const uint8_t *)gate->data + (size_t)idx[kk]*grb, grb);
+            memcpy(nu + (size_t)kk*urb, (const uint8_t *)up->data   + (size_t)idx[kk]*urb, urb);
+        }
+        // ffn_down: produce the new (n_embd x n_keep) kept columns, then re-quantize.
+        if (compensate == 2) {              // blockwise least-squares: absorb dropped into kept
+            for (int r = 0; r < n_embd; r++)
+                g4_dequant_row(down->type, (const uint8_t *)down->data + (size_t)r*drb, Wd + (size_t)r*n_ff0, n_ff0);
+            for (int r = 0; r < n_embd; r++)              // default = original kept cols (robust to remainder/empty blocks)
+                for (int kk = 0; kk < n_keep; kk++) newdf[(size_t)r*n_keep + kk] = Wd[(size_t)r*n_ff0 + idx[kk]];
+            for (int j = 0; j < n_ff0; j++) keptpos[j] = -1;
+            for (int kk = 0; kk < n_keep; kk++) keptpos[idx[kk]] = kk;
+            qwen_blockwise_ls(c->ffn_cov[il], c->cov_block, Wd, n_ff0, n_embd, kept, keptpos, n_keep, newdf);
+            for (int r = 0; r < n_embd; r++) {
+                uint8_t * o = nd + (size_t)r*dn_rb;
+                float * src = newdf + (size_t)r*n_keep;
+                switch (down_quant) {
+                    case G4_Q8_0: g4_quantize_q8_0(src, (block_q8_0 *)o, n_keep); break;
+                    case G4_Q4_0: g4_quantize_q4_0(src, (block_q4_0 *)o, n_keep); break;
+                    case G4_Q2_K: g4_quantize_q2_K(src, (block_q2_K *)o, n_keep); break;
+                    default:      g4_quantize_q3_K(src, (block_q3_K *)o, n_keep); break;
+                }
+            }
+        } else {
+            // gather kept columns verbatim; accumulate dropped mean into the bias (M2)
+            for (int r = 0; r < n_embd; r++) {
+                g4_dequant_row(down->type, (const uint8_t *)down->data + (size_t)r*drb, f, n_ff0);
+                for (int kk = 0; kk < n_keep; kk++) k[kk] = f[idx[kk]];
+                if (bias) {
+                    double s = 0;
+                    for (int j = 0; j < n_ff0; j++) if (!kept[j]) s += (double)c->ffn_mean[il][j] * f[j];
+                    bias[r] = (float)(s * inv_cnt);
+                }
+                uint8_t * o = nd + (size_t)r*dn_rb;
+                switch (down_quant) {
+                    case G4_Q8_0: g4_quantize_q8_0(k, (block_q8_0 *)o, n_keep); break;
+                    case G4_Q4_0: g4_quantize_q4_0(k, (block_q4_0 *)o, n_keep); break;
+                    case G4_Q2_K: g4_quantize_q2_K(k, (block_q2_K *)o, n_keep); break;
+                    default:      g4_quantize_q3_K(k, (block_q3_K *)o, n_keep); break;
+                }
+            }
+        }
+        gate->data = ng; gate->ne[1] = n_keep;
+        up->data   = nu; up->ne[1]   = n_keep;
+        down->data = nd; down->ne[0] = n_keep; down->type = down_quant;
+        free(c->ffn_bias[il]); c->ffn_bias[il] = bias;   // NULL when compensate==0
+    }
+    c->n_ff = n_keep;
+    free(f); free(k); free(score); free(idx); free(kept); free(Wd); free(newdf); free(keptpos);
+    return n_keep;
+}
+
+// Per-position logits without checkpointing (for perplexity / eval), token-major.
+float * g4_qwen_forward_logits(qwen_ctx * c, const int * tokens, int nb, int pos0, float * logits_out) {
+    g4_model_file * mf = c->mf;
+    const int n_embd = mf->n_embd;
+    const float eps = mf->rms_eps;
+    qwen_run_layers(c, tokens, nb, pos0);
+    for (int b = 0; b < nb; b++)
+        rms_norm(c->x + (size_t)b*n_embd, (const float *)c->output_norm->data,
+                 c->cur + (size_t)b*n_embd, n_embd, eps);
+    QMM(c, c->output, c->cur, logits_out, n_embd, mf->n_vocab, nb);
+    return logits_out;
+}
+
 // Roll recurrent conv/SSM state back to the checkpoint captured after batch index idx.
 void g4_qwen_state_restore(qwen_ctx * c, int idx) {
     for (int il = 0; il < c->mf->n_layer; il++) {
@@ -1344,4 +1706,20 @@ void g4_qwen_state_restore(qwen_ctx * c, int idx) {
         memcpy(c->conv_state[il], c->ck_conv[il] + (size_t)idx * c->ck_stride_conv, c->ck_stride_conv * sizeof(float));
         memcpy(c->ssm_state[il],  c->ck_ssm[il]  + (size_t)idx * c->ck_stride_ssm,  c->ck_stride_ssm  * sizeof(float));
     }
+}
+
+// Build a self-speculative draft: a low-bit (draft_quant) in-RAM requant of the
+// target's matmul weights, same architecture. Deep-copies the model header + tensor
+// array so the requant produces a SEPARATE weight set (the target is untouched, and
+// the draft shares the target's mmap for the tensors that aren't requantized, e.g.
+// embeddings/norms). The draft gets its own scratch + recurrent state via qwen_init.
+int g4_qwen_make_draft(qwen_ctx * draft, g4_model_file * mf_target, int draft_quant, int n_ctx, int n_threads) {
+    g4_model_file * mf_draft = malloc(sizeof(g4_model_file));
+    if (!mf_draft) return 1;
+    *mf_draft = *mf_target;                                              // copy header
+    mf_draft->tensors = malloc((size_t)mf_target->n_tensors * sizeof(g4_tensor));
+    if (!mf_draft->tensors) { free(mf_draft); return 1; }
+    memcpy(mf_draft->tensors, mf_target->tensors, (size_t)mf_target->n_tensors * sizeof(g4_tensor));
+    g4_jit_requant(mf_draft, draft_quant, n_threads, false);             // requant the COPY
+    return g4_qwen_init(draft, mf_draft, n_ctx, n_threads);
 }
